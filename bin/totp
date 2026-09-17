@@ -1,0 +1,740 @@
+#!/usr/bin/env python3
+"""Sesame backend: encrypted TOTP account store, code generation, QR decoding.
+
+Storage
+  ~/.config/sesame/store.json     AES-256-GCM envelope around a JSON document
+  GNOME Keyring                   the 32-byte store key (via secret-tool)
+
+Every command prints JSON on stdout (unless noted) and a human-readable
+error on stderr with a non-zero exit code.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+VERSION = "1.0.0"
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+STORE_DIR = Path(os.environ.get("SESAME_DIR", CONFIG_HOME / "sesame"))
+STORE_FILE = STORE_DIR / "store.json"
+LOCK_FILE = STORE_DIR / "store.lock"
+STORE_FORMAT = "sesame-store"
+STORE_VERSION = 1
+AAD = b"sesame/store/v1"
+KEYRING_ATTRS = ["application", "sesame", "purpose", "store-key"]
+KEYRING_LABEL = "Sesame account store key"
+# The plugin was called dod.totp before its first public release. A store and
+# key left by that version are adopted on first use.
+LEGACY_STORE_DIR = CONFIG_HOME / "dod-totp"
+LEGACY_FORMATS = {"dod-totp-store": b"dod-totp/store/v1"}
+LEGACY_KEYRING_ATTRS = ["application", "dod-totp", "purpose", "store-key"]
+ALGORITHMS = {"SHA1": hashlib.sha1, "SHA256": hashlib.sha256, "SHA512": hashlib.sha512}
+FLATHACK_STORE = CONFIG_HOME / "omarchy-otp" / "accounts.json"
+
+
+class TotpError(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------- #
+# TOTP
+# --------------------------------------------------------------------------- #
+
+def normalize_secret(secret: str) -> str:
+    cleaned = re.sub(r"[\s-]", "", str(secret or "")).upper()
+    if not cleaned:
+        raise TotpError("Secret is empty.")
+    if not re.fullmatch(r"[A-Z2-7]+=*", cleaned):
+        raise TotpError("Secret is not valid Base32.")
+    cleaned = cleaned.rstrip("=")
+    padded = cleaned + "=" * (-len(cleaned) % 8)
+    try:
+        base64.b32decode(padded, casefold=True)
+    except Exception as error:  # noqa: BLE001
+        raise TotpError(f"Secret is not valid Base32: {error}") from error
+    return cleaned
+
+
+def decode_secret(secret: str) -> bytes:
+    cleaned = normalize_secret(secret)
+    return base64.b32decode(cleaned + "=" * (-len(cleaned) % 8), casefold=True)
+
+
+def hotp(key: bytes, counter: int, digits: int = 6, algorithm: str = "SHA1") -> str:
+    digest_fn = ALGORITHMS.get(algorithm.upper())
+    if digest_fn is None:
+        raise TotpError(f"Unsupported algorithm: {algorithm}")
+    mac = hmac.new(key, struct.pack(">Q", counter), digest_fn).digest()
+    offset = mac[-1] & 0x0F
+    binary = struct.unpack(">I", mac[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(binary % (10 ** digits)).zfill(digits)
+
+
+def totp(secret: str, now: float | None = None, period: int = 30, digits: int = 6,
+         algorithm: str = "SHA1") -> tuple[str, int, int]:
+    """Return (code, counter, seconds_remaining)."""
+    now = time.time() if now is None else now
+    period = max(1, int(period))
+    counter = int(now // period)
+    remaining = period - int(now) % period
+    return hotp(decode_secret(secret), counter, digits, algorithm), counter, remaining
+
+
+def display_code(code: str) -> str:
+    if len(code) == 6:
+        return f"{code[:3]} {code[3:]}"
+    if len(code) == 8:
+        return f"{code[:4]} {code[4:]}"
+    if len(code) == 7:
+        return f"{code[:3]} {code[3:]}"
+    return code
+
+
+# --------------------------------------------------------------------------- #
+# otpauth:// and otpauth-migration:// parsing
+# --------------------------------------------------------------------------- #
+
+def parse_otpauth(uri: str) -> dict:
+    uri = str(uri or "").strip()
+    parsed = urlparse(uri)
+    if parsed.scheme.lower() != "otpauth":
+        raise TotpError("Not an otpauth:// URL.")
+    if parsed.netloc.lower() != "totp":
+        raise TotpError(f"Only TOTP is supported (got {parsed.netloc or 'nothing'}).")
+    label = unquote(parsed.path.lstrip("/"))
+    params = {k.lower(): v[0] for k, v in parse_qs(parsed.query).items() if v}
+    issuer_label, _, name = label.partition(":") if ":" in label else ("", "", label)
+    issuer = params.get("issuer") or issuer_label.strip()
+    name = name.strip() or issuer or "Account"
+    account = {
+        "name": name,
+        "issuer": issuer.strip(),
+        "secret": normalize_secret(params.get("secret", "")),
+        "digits": int(params.get("digits", 6) or 6),
+        "period": int(params.get("period", 30) or 30),
+        "algorithm": (params.get("algorithm") or "SHA1").upper(),
+    }
+    validate_account(account)
+    return account
+
+
+def _read_varint(data: bytes, pos: int) -> tuple[int, int]:
+    result = shift = 0
+    while True:
+        if pos >= len(data):
+            raise TotpError("Truncated migration payload.")
+        byte = data[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, pos
+        shift += 7
+
+
+def _protobuf_fields(data: bytes):
+    """Yield (field_number, wire_type, value) for a protobuf message."""
+    pos = 0
+    while pos < len(data):
+        tag, pos = _read_varint(data, pos)
+        field, wire = tag >> 3, tag & 0x07
+        if wire == 0:
+            value, pos = _read_varint(data, pos)
+        elif wire == 2:
+            length, pos = _read_varint(data, pos)
+            value = data[pos:pos + length]
+            pos += length
+        elif wire == 1:
+            value, pos = data[pos:pos + 8], pos + 8
+        elif wire == 5:
+            value, pos = data[pos:pos + 4], pos + 4
+        else:
+            raise TotpError(f"Unsupported protobuf wire type {wire}.")
+        yield field, wire, value
+
+
+def parse_migration(uri: str) -> list[dict]:
+    """Decode a Google Authenticator export (otpauth-migration://offline?data=...)."""
+    parsed = urlparse(str(uri or "").strip())
+    if parsed.scheme.lower() != "otpauth-migration":
+        raise TotpError("Not an otpauth-migration:// URL.")
+    params = parse_qs(parsed.query)
+    raw = params.get("data", [""])[0]
+    if not raw:
+        raise TotpError("Migration URL has no data.")
+    raw = unquote(raw).replace(" ", "+")
+    payload = base64.b64decode(raw + "=" * (-len(raw) % 4))
+    accounts = []
+    for field, wire, value in _protobuf_fields(payload):
+        if field != 1 or wire != 2:
+            continue
+        entry = {"secret": b"", "name": "", "issuer": "", "algorithm": 1, "digits": 1, "type": 2}
+        for sub_field, sub_wire, sub_value in _protobuf_fields(value):
+            if sub_field == 1:
+                entry["secret"] = sub_value
+            elif sub_field == 2:
+                entry["name"] = sub_value.decode("utf-8", "replace")
+            elif sub_field == 3:
+                entry["issuer"] = sub_value.decode("utf-8", "replace")
+            elif sub_field == 4:
+                entry["algorithm"] = sub_value
+            elif sub_field == 5:
+                entry["digits"] = sub_value
+            elif sub_field == 6:
+                entry["type"] = sub_value
+        if entry["type"] != 2:
+            continue  # HOTP entries are skipped
+        if not entry["secret"]:
+            continue
+        algorithm = {1: "SHA1", 2: "SHA256", 3: "SHA512"}.get(entry["algorithm"], "SHA1")
+        digits = {1: 6, 2: 8}.get(entry["digits"], 6)
+        name = entry["name"]
+        issuer = entry["issuer"]
+        if not issuer and ":" in name:
+            issuer, _, name = name.partition(":")
+        account = {
+            "name": name.strip() or issuer.strip() or "Account",
+            "issuer": issuer.strip(),
+            "secret": base64.b32encode(entry["secret"]).decode("ascii").rstrip("="),
+            "digits": digits,
+            "period": 30,
+            "algorithm": algorithm,
+        }
+        validate_account(account)
+        accounts.append(account)
+    if not accounts:
+        raise TotpError("No TOTP accounts found in the migration payload.")
+    return accounts
+
+
+def parse_any(text: str) -> list[dict]:
+    text = str(text or "").strip()
+    lowered = text.lower()
+    if lowered.startswith("otpauth-migration://"):
+        return parse_migration(text)
+    if lowered.startswith("otpauth://"):
+        return [parse_otpauth(text)]
+    raise TotpError("Not an otpauth:// or otpauth-migration:// URL.")
+
+
+def to_otpauth(account: dict) -> str:
+    from urllib.parse import quote, urlencode
+    label = f"{account['issuer']}:{account['name']}" if account.get("issuer") else account["name"]
+    query = {"secret": account["secret"]}
+    if account.get("issuer"):
+        query["issuer"] = account["issuer"]
+    if int(account.get("digits", 6)) != 6:
+        query["digits"] = str(account["digits"])
+    if int(account.get("period", 30)) != 30:
+        query["period"] = str(account["period"])
+    if str(account.get("algorithm", "SHA1")).upper() != "SHA1":
+        query["algorithm"] = account["algorithm"].upper()
+    return f"otpauth://totp/{quote(label, safe='')}?{urlencode(query)}"
+
+
+def validate_account(account: dict) -> None:
+    if not str(account.get("name", "")).strip():
+        raise TotpError("Account name is empty.")
+    if int(account.get("digits", 6)) not in (6, 7, 8):
+        raise TotpError("Digits must be 6, 7 or 8.")
+    if not 5 <= int(account.get("period", 30)) <= 300:
+        raise TotpError("Period must be between 5 and 300 seconds.")
+    if str(account.get("algorithm", "SHA1")).upper() not in ALGORITHMS:
+        raise TotpError(f"Unsupported algorithm: {account.get('algorithm')}")
+    normalize_secret(account.get("secret", ""))
+
+
+# --------------------------------------------------------------------------- #
+# Encrypted store
+# --------------------------------------------------------------------------- #
+
+def _aesgcm():
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError as error:
+        raise TotpError(
+            "python-cryptography is missing. Install the python-cryptography package."
+        ) from error
+    return AESGCM
+
+
+def _secret_tool(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+    if shutil.which("secret-tool") is None:
+        raise TotpError("secret-tool is missing. Install the libsecret package.")
+    return subprocess.run(["secret-tool", *args], input=stdin, capture_output=True, text=True,
+                          check=False, timeout=30)
+
+
+def load_key(create: bool = False) -> bytes:
+    override = os.environ.get("SESAME_KEY")  # tests only
+    if override:
+        return base64.b64decode(override)
+    result = _secret_tool("lookup", *KEYRING_ATTRS)
+    encoded = result.stdout.strip()
+    if result.returncode == 0 and encoded:
+        return base64.b64decode(encoded)
+    legacy = _secret_tool("lookup", *LEGACY_KEYRING_ATTRS).stdout.strip()
+    if legacy:
+        _secret_tool("store", "--label", KEYRING_LABEL, *KEYRING_ATTRS, stdin=legacy)
+        return base64.b64decode(legacy)
+    if not create:
+        raise TotpError("No store key in the keyring yet. Add an account first.")
+    key = secrets.token_bytes(32)
+    stored = _secret_tool("store", "--label", KEYRING_LABEL, *KEYRING_ATTRS,
+                          stdin=base64.b64encode(key).decode("ascii"))
+    if stored.returncode != 0:
+        raise TotpError("Could not save the store key to GNOME Keyring: "
+                        + (stored.stderr.strip() or "unknown error"))
+    return key
+
+
+def ensure_dir() -> None:
+    if ("SESAME_DIR" not in os.environ and not STORE_DIR.exists()
+            and LEGACY_STORE_DIR.is_dir() and not LEGACY_STORE_DIR.is_symlink()):
+        os.rename(LEGACY_STORE_DIR, STORE_DIR)
+    if STORE_DIR.is_symlink():
+        raise TotpError(f"Refusing symlinked store directory: {STORE_DIR}")
+    STORE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(STORE_DIR, 0o700)
+
+
+@contextmanager
+def store_lock():
+    ensure_dir()
+    with open(LOCK_FILE, "a+", encoding="utf-8") as handle:
+        os.chmod(LOCK_FILE, 0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def read_store() -> dict:
+    ensure_dir()
+    if not STORE_FILE.exists():
+        return {"accounts": []}
+    if STORE_FILE.is_symlink():
+        raise TotpError(f"Refusing symlinked store: {STORE_FILE}")
+    envelope = json.loads(STORE_FILE.read_text(encoding="utf-8"))
+    aad = AAD if envelope.get("format") == STORE_FORMAT else LEGACY_FORMATS.get(envelope.get("format"))
+    if aad is None:
+        raise TotpError("Store file has an unknown format.")
+    AESGCM = _aesgcm()
+    key = load_key()
+    nonce = base64.b64decode(envelope["nonce"])
+    ciphertext = base64.b64decode(envelope["ciphertext"])
+    try:
+        plaintext = AESGCM(key).decrypt(nonce, ciphertext, aad)
+    except Exception as error:  # noqa: BLE001
+        raise TotpError("Could not decrypt the store (wrong keyring key?).") from error
+    data = json.loads(plaintext.decode("utf-8"))
+    data.setdefault("accounts", [])
+    return data
+
+
+def write_store(data: dict) -> None:
+    ensure_dir()
+    AESGCM = _aesgcm()
+    key = load_key(create=True)
+    nonce = secrets.token_bytes(12)
+    plaintext = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    envelope = {
+        "format": STORE_FORMAT,
+        "version": STORE_VERSION,
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext": base64.b64encode(AESGCM(key).encrypt(nonce, plaintext, AAD)).decode("ascii"),
+        "updatedAt": int(time.time()),
+    }
+    fd, tmp_path = tempfile.mkstemp(dir=STORE_DIR, prefix=".store-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(envelope, handle, indent=2)
+            handle.write("\n")
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, STORE_FILE)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def public_view(account: dict, now: float | None = None) -> dict:
+    code, counter, remaining = totp(account["secret"], now, account["period"],
+                                    account["digits"], account["algorithm"])
+    return {
+        "id": account["id"],
+        "name": account["name"],
+        "issuer": account.get("issuer", ""),
+        "digits": account["digits"],
+        "period": account["period"],
+        "algorithm": account["algorithm"],
+        "code": code,
+        "displayCode": display_code(code),
+        "counter": counter,
+        "remaining": remaining,
+    }
+
+
+def sort_key(account: dict):
+    return ((account.get("issuer") or account.get("name") or "").lower(),
+            (account.get("name") or "").lower())
+
+
+def find_account(data: dict, account_id: str) -> dict:
+    for account in data["accounts"]:
+        if account["id"] == account_id:
+            return account
+    raise TotpError(f"No account with id {account_id}.")
+
+
+def is_duplicate(data: dict, candidate: dict) -> dict | None:
+    for account in data["accounts"]:
+        if (account["secret"] == candidate["secret"]
+                and account["name"].lower() == candidate["name"].lower()
+                and (account.get("issuer") or "").lower() == (candidate.get("issuer") or "").lower()):
+            return account
+    return None
+
+
+def add_accounts(candidates: list[dict]) -> dict:
+    added, skipped = [], []
+    with store_lock():
+        data = read_store()
+        for candidate in candidates:
+            validate_account(candidate)
+            existing = is_duplicate(data, candidate)
+            if existing:
+                skipped.append(public_view(existing))
+                continue
+            account = {
+                "id": uuid.uuid4().hex[:12],
+                "name": candidate["name"].strip(),
+                "issuer": (candidate.get("issuer") or "").strip(),
+                "secret": normalize_secret(candidate["secret"]),
+                "digits": int(candidate.get("digits", 6)),
+                "period": int(candidate.get("period", 30)),
+                "algorithm": str(candidate.get("algorithm", "SHA1")).upper(),
+                "createdAt": int(time.time()),
+            }
+            data["accounts"].append(account)
+            added.append(public_view(account))
+        if added:
+            write_store(data)
+    return {"added": added, "skipped": skipped}
+
+
+# --------------------------------------------------------------------------- #
+# Clipboard
+# --------------------------------------------------------------------------- #
+
+def copy_to_clipboard(text: str, clear_after: int) -> None:
+    if shutil.which("wl-copy") is None:
+        raise TotpError("wl-copy is missing. Install the wl-clipboard package.")
+    # --sensitive tells clipboard managers not to record the code. It goes over
+    # stdin so it never shows up in the process list.
+    subprocess.run(["wl-copy", "--sensitive"], input=text, text=True, check=True, timeout=10)
+    if clear_after <= 0:
+        return
+    # Detached watcher: clears the clipboard only if it still holds this code.
+    # It is handed a hash, not the code.
+    script = (
+        "import hashlib,subprocess,sys,time\n"
+        f"time.sleep({int(clear_after)})\n"
+        "try:\n"
+        "  current=subprocess.run(['wl-paste','--no-newline'],capture_output=True,timeout=5).stdout\n"
+        "except Exception:\n"
+        "  sys.exit(0)\n"
+        "if hashlib.sha256(current).hexdigest()==sys.argv[1]:\n"
+        "  subprocess.run(['wl-copy','--clear'],timeout=5)\n"
+    )
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    subprocess.Popen([sys.executable, "-c", script, digest], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+# --------------------------------------------------------------------------- #
+# QR decoding
+# --------------------------------------------------------------------------- #
+
+def decode_image(path: str) -> list[str]:
+    if shutil.which("zbarimg") is None:
+        raise TotpError("zbarimg is missing. Install the zbar package.")
+    result = subprocess.run(["zbarimg", "-q", "--raw", "-Sdisable", "-Sqrcode.enable", path],
+                            capture_output=True, text=True, check=False, timeout=20)
+    if result.returncode not in (0, 4):  # 4 = nothing found
+        raise TotpError(result.stderr.strip() or "zbarimg failed.")
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+
+def emit(payload) -> None:
+    json.dump(payload, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def cmd_list(args) -> None:
+    with store_lock():
+        data = read_store()
+    now = time.time()
+    accounts = [public_view(account, now) for account in sorted(data["accounts"], key=sort_key)]
+    emit({"accounts": accounts, "now": int(now)})
+
+
+def cmd_code(args) -> None:
+    with store_lock():
+        account = find_account(read_store(), args.id)
+    print(public_view(account)["code"])
+
+
+def cmd_copy(args) -> None:
+    with store_lock():
+        account = find_account(read_store(), args.id)
+    view = public_view(account)
+    copy_to_clipboard(view["code"], args.clear_after)
+    emit({"copied": True, "id": view["id"], "remaining": view["remaining"]})
+
+
+def read_stdin_text() -> str:
+    return sys.stdin.read().strip()
+
+
+def cmd_add(args) -> None:
+    if args.uri or args.stdin:
+        text = read_stdin_text() if args.stdin else args.uri
+        emit(add_accounts(parse_any(text)))
+        return
+    if args.secret:
+        emit(add_accounts([{
+            "name": args.name or "Account",
+            "issuer": args.issuer or "",
+            "secret": args.secret,
+            "digits": args.digits,
+            "period": args.period,
+            "algorithm": args.algorithm,
+        }]))
+        return
+    interactive_add()
+
+
+def interactive_add() -> None:
+    """Terminal flow used by the popup's manual-entry action."""
+    print("Sesame — add an account\n")
+    text = input("Paste an otpauth:// URL, or press Enter for manual entry: ").strip()
+    if text:
+        result = add_accounts(parse_any(text))
+    else:
+        issuer = input("Issuer (e.g. GitHub): ").strip()
+        name = input("Account (e.g. you@example.com): ").strip() or issuer
+        secret = input("Base32 secret: ").strip()
+        digits = input("Digits [6]: ").strip() or "6"
+        period = input("Period seconds [30]: ").strip() or "30"
+        algorithm = input("Algorithm SHA1/SHA256/SHA512 [SHA1]: ").strip() or "SHA1"
+        result = add_accounts([{"name": name, "issuer": issuer, "secret": secret,
+                                "digits": int(digits), "period": int(period),
+                                "algorithm": algorithm.upper()}])
+    for account in result["added"]:
+        print(f"Added {account['issuer']} · {account['name']}  → {account['displayCode']}")
+    for account in result["skipped"]:
+        print(f"Already present: {account['issuer']} · {account['name']}")
+    if not result["added"]:
+        sys.exit(2)
+
+
+def cmd_decode(args) -> None:
+    """Decode QR payloads in an image; never stores anything."""
+    found = []
+    invalid = []
+    for payload in decode_image(args.image):
+        try:
+            for account in parse_any(payload):
+                found.append({
+                    "name": account["name"],
+                    "issuer": account["issuer"],
+                    "digits": account["digits"],
+                    "period": account["period"],
+                    "algorithm": account["algorithm"],
+                })
+        except TotpError as error:
+            invalid.append(str(error))
+    if args.add and found:
+        result = add_accounts([account for payload in decode_image(args.image)
+                               for account in parse_any(payload)])
+        emit({"found": found, "invalid": invalid, **result})
+        return
+    emit({"found": found, "invalid": invalid})
+
+
+def cmd_remove(args) -> None:
+    with store_lock():
+        data = read_store()
+        account = find_account(data, args.id)
+        if not args.yes:
+            answer = input(f"Delete {account.get('issuer','')} · {account['name']}? [y/N] ").strip().lower()
+            if answer != "y":
+                emit({"removed": False})
+                return
+        data["accounts"] = [entry for entry in data["accounts"] if entry["id"] != args.id]
+        write_store(data)
+    emit({"removed": True, "id": args.id})
+
+
+def cmd_rename(args) -> None:
+    with store_lock():
+        data = read_store()
+        account = find_account(data, args.id)
+        if args.name is not None:
+            account["name"] = args.name.strip() or account["name"]
+        if args.issuer is not None:
+            account["issuer"] = args.issuer.strip()
+        validate_account(account)
+        write_store(data)
+    emit(public_view(account))
+
+
+def cmd_export(args) -> None:
+    with store_lock():
+        data = read_store()
+    for account in sorted(data["accounts"], key=sort_key):
+        print(to_otpauth(account))
+
+
+def cmd_import(args) -> None:
+    """Import from a file of otpauth:// URLs (one per line) or a flathack.otp accounts.json."""
+    path = Path(args.path)
+    if not path.exists():
+        raise TotpError(f"{path} does not exist.")
+    text = path.read_text(encoding="utf-8")
+    candidates = []
+    if path.suffix == ".json":
+        entries = json.loads(text)
+        if not isinstance(entries, list):
+            raise TotpError("Expected a JSON list of accounts (flathack.otp format).")
+        for entry in entries:
+            candidates.append({
+                "name": entry.get("name", ""),
+                "issuer": entry.get("issuer", ""),
+                "secret": entry.get("secret", ""),
+                "digits": int(entry.get("digits", 6)),
+                "period": int(entry.get("period", 30)),
+                "algorithm": str(entry.get("algorithm", "SHA1")).upper(),
+            })
+    else:
+        for line in text.splitlines():
+            if line.strip():
+                candidates.extend(parse_any(line))
+    emit(add_accounts(candidates))
+
+
+def cmd_status(args) -> None:
+    key_present = _secret_tool("lookup", *KEYRING_ATTRS).returncode == 0
+    emit({
+        "version": VERSION,
+        "store": str(STORE_FILE),
+        "storeExists": STORE_FILE.exists(),
+        "keyInKeyring": key_present,
+        "cryptography": _module_available("cryptography"),
+        "zbarimg": shutil.which("zbarimg") is not None,
+        "wlCopy": shutil.which("wl-copy") is not None,
+        "flathackStore": str(FLATHACK_STORE) if FLATHACK_STORE.exists() else None,
+    })
+
+
+def _module_available(name: str) -> bool:
+    try:
+        __import__(name)
+        return True
+    except ImportError:
+        return False
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="totp", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=VERSION)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("list", help="all accounts with their current codes (JSON)").set_defaults(fn=cmd_list)
+    sub.add_parser("status", help="dependency and store status (JSON)").set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("code", help="print the current code for an account")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_code)
+
+    p = sub.add_parser("copy", help="copy the current code to the Wayland clipboard")
+    p.add_argument("id")
+    p.add_argument("--clear-after", type=int, default=30, help="seconds until the clipboard is cleared (0 = never)")
+    p.set_defaults(fn=cmd_copy)
+
+    p = sub.add_parser("add", help="add an account (otpauth URL, flags, or interactive)")
+    p.add_argument("--uri", help="otpauth:// or otpauth-migration:// URL")
+    p.add_argument("--stdin", action="store_true", help="read the URL from stdin (keeps it out of argv)")
+    p.add_argument("--name")
+    p.add_argument("--issuer")
+    p.add_argument("--secret", help="Base32 secret")
+    p.add_argument("--digits", type=int, default=6)
+    p.add_argument("--period", type=int, default=30)
+    p.add_argument("--algorithm", default="SHA1")
+    p.set_defaults(fn=cmd_add)
+
+    p = sub.add_parser("decode", help="decode QR codes in an image (JSON); --add stores them")
+    p.add_argument("image")
+    p.add_argument("--add", action="store_true")
+    p.set_defaults(fn=cmd_decode)
+
+    p = sub.add_parser("remove", help="delete an account")
+    p.add_argument("id")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(fn=cmd_remove)
+
+    p = sub.add_parser("rename", help="change an account's name or issuer")
+    p.add_argument("id")
+    p.add_argument("--name")
+    p.add_argument("--issuer")
+    p.set_defaults(fn=cmd_rename)
+
+    sub.add_parser("export", help="print every account as an otpauth:// URL").set_defaults(fn=cmd_export)
+
+    p = sub.add_parser("import", help="import otpauth URLs (one per line) or a flathack.otp accounts.json")
+    p.add_argument("path")
+    p.set_defaults(fn=cmd_import)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        args.fn(args)
+    except TotpError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    except (KeyboardInterrupt, EOFError):
+        print("Cancelled.", file=sys.stderr)
+        return 130
+    except subprocess.TimeoutExpired:
+        print("A helper command timed out.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

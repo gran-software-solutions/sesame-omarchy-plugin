@@ -1,0 +1,48 @@
+# Tasks for the Sesame Omarchy plugin.
+#
+# Run `mise trust` once, then `mise tasks` to list everything.
+
+[tasks.link]
+description = "Symlink this checkout into ~/.config/omarchy/plugins and rescan"
+run = """
+set -euo pipefail
+ln -sfn "$PWD" ~/.config/omarchy/plugins/de.gransoftware.sesame
+omarchy-shell -q shell rescanPlugins || true
+"""
+
+[tasks.enable]
+description = "Enable the installed plugin in the bar"
+run = """
+set -euo pipefail
+omarchy plugin enable de.gransoftware.sesame --section right
+omarchy plugin list
+"""
+
+[tasks.validate]
+description = "Validate manifest.json against the Omarchy plugin schema"
+run = 'omarchy plugin validate "$PWD"'
+
+[tasks.lint]
+description = "qmllint every QML file against the installed Omarchy shell modules"
+run = """
+set -euo pipefail
+QMLLINT=$(command -v qmllint || echo /usr/lib/qt6/bin/qmllint)
+ROOT=$(mktemp -d)
+trap 'rm -rf "$ROOT"' EXIT
+ln -s "${OMARCHY_PATH:-/usr/share/omarchy}/shell" "$ROOT/qs"
+shopt -s nullglob
+FILES=(*.qml)
+"$QMLLINT" -I "$ROOT" "${FILES[@]}"
+"""
+
+[tasks.test]
+description = "Run the backend unit tests against a temp store with a throwaway key"
+run = 'python3 -m unittest discover -s tests -v'
+
+[tasks.check]
+description = "Validate the manifest, lint the QML and run the backend tests"
+depends = ["validate", "lint", "test"]
+
+[tasks.uninstall]
+description = "Remove the plugin from the Omarchy shell (keeps the encrypted store and keyring key)"
+run = 'omarchy plugin remove de.gransoftware.sesame'

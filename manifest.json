@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "id": "de.gransoftware.sesame",
+  "name": "Sesame",
+  "version": "1.0.0",
+  "author": "Gran Software Solutions",
+  "license": "MIT",
+  "description": "Two-factor codes in the bar: encrypted store, copy on Enter, add accounts by holding a QR code up to the webcam",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Sesame",
+    "description": "Click to open the code list; Enter copies. Ctrl+S scans a QR code with the webcam.",
+    "category": "Security",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "icon": "",
+      "clipboardClearSeconds": 30,
+      "closeOnCopy": true,
+      "mirrorPreview": true
+    },
+    "schema": [
+      {
+        "key": "icon",
+        "type": "string",
+        "label": "Bar icon",
+        "defaultValue": "",
+        "description": "Nerd Font glyph or its hex codepoint (e.g. f099d). Empty uses the shield-key glyph."
+      },
+      {
+        "key": "clipboardClearSeconds",
+        "type": "integer",
+        "label": "Clear clipboard after (seconds)",
+        "min": 0,
+        "max": 300,
+        "step": 5,
+        "defaultValue": 30,
+        "description": "Clear a copied code if the clipboard still holds it. 0 disables."
+      },
+      {
+        "key": "closeOnCopy",
+        "type": "boolean",
+        "label": "Close the popup after copying",
+        "defaultValue": true
+      },
+      {
+        "key": "mirrorPreview",
+        "type": "boolean",
+        "label": "Mirror the camera preview",
+        "defaultValue": true,
+        "description": "Selfie-style preview while scanning. Decoding is unaffected."
+      }
+    ]
+  }
+}
