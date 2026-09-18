@@ -23,7 +23,7 @@ Vendored by `fetch_brands.py`. Unmodified upstream files.
 | `xing.svg` | simple-icons/xing | CC0-1.0 |
 | `zoho.svg` | simple-icons/zoho | CC0-1.0 |
 
-Phosphor: https://github.com/phosphor-icons/core (MIT)
+Phosphor: https://github.com/phosphor-icons/core (MIT, full text in `LICENSE` here)
 Simple Icons: https://github.com/simple-icons/simple-icons (CC0-1.0)
 
 The marks themselves remain trademarks of their owners. They are used

@@ -208,5 +208,5 @@ one more reason to read the source first.
 
 Brand marks from [Phosphor Icons](https://phosphoricons.com) (MIT) and
 [Simple Icons](https://simpleicons.org) (CC0) — see
-[`brands/SOURCES.md`](brands/SOURCES.md). The marks remain trademarks of their
+[`brands/SOURCES.md`](brands/SOURCES.md) and [`brands/LICENSE`](brands/LICENSE). The marks remain trademarks of their
 owners.
