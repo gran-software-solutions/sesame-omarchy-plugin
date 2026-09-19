@@ -64,8 +64,9 @@ Panel {
   readonly property color dim: Qt.darker(foreground, 1.45)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  // Card language shared with Yank: bordered cards, spaced uppercase
-  // section labels, an icon column, an accent marker on the focused row.
+  // Visual language shared with Yank: one flat surface split by hairlines, a
+  // search field beside a segmented control, two-line rows with a leading
+  // tile and an accent marker on the focused row, and a footer of key hints.
   //
   // Every value below is a theme token rather than a number chosen here. The
   // plugin used to pick its own alphas and sizes, which meant it kept its
@@ -109,22 +110,30 @@ Panel {
   // badge, two lines of label and a 20px countdown ring, which the stock
   // popup row height is too short for. Taking the larger of the two keeps the
   // rows legible while still growing if the theme scales spacing up.
-  readonly property int rowHeight: Math.max(Style.spacing.popupRowHeight + Style.space(6), Style.space(46))
+  readonly property int rowHeight: Math.max(Style.spacing.popupRowHeight + Style.space(6), Style.space(48))
+  readonly property int headerHeight: Style.space(34)
+  readonly property color hairline: Util.alpha(foreground, 0.08)
+  readonly property color hintLabel: Util.alpha(foreground, 0.68)
+  // A white keycap reads as a physical key on a light popup but is a pale,
+  // unreadable block on a dark one, so dark themes get a faint tint instead.
+  readonly property bool lightTheme: Color.popups.background.hslLightness > 0.5
+  readonly property color keycapFill: lightTheme ? Util.alpha("#ffffff", 0.55) : Util.alpha(foreground, 0.07)
 
   readonly property int labelFont: Math.max(9, Math.round(Style.font.caption * 0.82))
   readonly property int capHeight: labelFont + Style.space(7)
   readonly property int keyColumnWidth: Style.space(80)
-  property bool footerHovered: false
+  // The full shortcut list, toggled from the footer's keyboard button.
+  property bool shortcutsOpen: false
 
-  // Collapsed footer: the one or two things you most likely want next.
+  // Footer hints: the few things you most likely want next.
   readonly property var primaryHints: {
-    if (mode === "scan") return [{ keys: ["Ctrl", "N"], label: "type it instead" }, { keys: ["Esc"], label: "back" }]
-    if (mode === "confirm") return [{ keys: ["⏎"], label: "add" }, { keys: ["Esc"], label: "discard" }]
-    if (mode === "manual") return [{ keys: ["⏎"], label: "save" }, { keys: ["Esc"], label: "back" }]
-    return [{ keys: ["⏎"], label: "copy" }, { keys: ["Ctrl", "S"], label: "scan" }]
+    if (mode === "scan") return [{ keys: "Ctrl+N", label: "Type it" }, { keys: "Esc", label: "Back" }]
+    if (mode === "confirm") return [{ keys: "Enter", label: "Add", primary: true }, { keys: "Esc", label: "Discard" }]
+    if (mode === "manual") return [{ keys: "Enter", label: "Save", primary: true }, { keys: "Tab", label: "Next" }, { keys: "Esc", label: "Back" }]
+    return [{ keys: "Enter", label: "Copy", primary: true }, { keys: "Ctrl+S", label: "Scan" }, { keys: "Ctrl+N", label: "Add" }]
   }
 
-  // Expanded footer: every binding of the current mode, grouped.
+  // Every binding of the current mode, grouped.
   readonly property var shortcutGroups: {
     if (mode === "scan") return [
       { title: "SCANNER", rows: [
@@ -188,7 +197,7 @@ Panel {
     deleteConfirmOpen = false
     deleteTarget = null
     resetManual()
-    footerHovered = false
+    shortcutsOpen = false
     mode = "list"
   }
 
@@ -375,8 +384,8 @@ Panel {
     resetManual()
     mode = "list"
     filterText = ""
-    flash(added > 0 ? (added === 1 ? "ADDED" : "ADDED " + added)
-                    : (skipped > 0 ? "ALREADY PRESENT" : ""))
+    flash(added > 0 ? (added === 1 ? "Added" : "Added " + added)
+                    : (skipped > 0 ? "Already present" : ""))
     refresh()
   }
 
@@ -455,8 +464,8 @@ Panel {
     scanFound = []
     mode = "list"
     filterText = ""
-    flash(added > 0 ? (added === 1 ? "ADDED" : "ADDED " + added)
-                    : (skipped > 0 ? "ALREADY PRESENT" : ""))
+    flash(added > 0 ? (added === 1 ? "Added" : "Added " + added)
+                    : (skipped > 0 ? "Already present" : ""))
     refresh()
   }
 
@@ -497,7 +506,7 @@ Panel {
     stderr: StdioCollector { id: copyStderr; waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode === 0) {
-        root.flash("COPIED")
+        root.flash("Copied")
         if (root.setting("closeOnCopy", true)) closeTimer.restart()
       } else {
         root.errorText = String(copyStderr.text || "").trim() || "Could not copy the code."
@@ -509,7 +518,7 @@ Panel {
     id: removeProcess
     stderr: StdioCollector { id: removeStderr; waitForEnd: true }
     onExited: function(exitCode) {
-      if (exitCode === 0) { root.flash("DELETED"); root.refresh() }
+      if (exitCode === 0) { root.flash("Deleted"); root.refresh() }
       else root.errorText = String(removeStderr.text || "").trim() || "Could not delete the account."
       Qt.callLater(root.focusForMode)
     }
@@ -598,75 +607,60 @@ Panel {
   }
 
   // ---- reusable pieces ----------------------------------------------------
+  //
+  // Same visual language as Yank: one flat surface split by hairlines, a
+  // search field with a segmented control beside it, two-line rows with a
+  // leading tile, and a footer of key hints. Everything is derived from the
+  // theme's foreground/accent so it restyles with the desktop.
 
-  // A card is an idle control surface, so it takes the theme's normal-state
-  // fill. The border is the same token at reduced alpha: a full-strength
-  // control border around a card this large reads as a box rather than a
-  // surface, and the kit's own cards (PopupCard, the clock panel) take the
-  // same route.
-  component Card: Rectangle {
-    radius: root.cardRadius
-    color: Style.normalFillFor(root.foreground, Color.accent)
-    border.color: Util.alpha(Style.normalBorderFor(root.foreground, Color.accent), 0.55)
-    border.width: 1
+  component Divider: Rectangle {
+    width: parent ? parent.width : 0
+    height: 1
+    color: root.hairline
   }
 
   component SectionLabel: Text {
     textFormat: Text.PlainText
-    color: root.secondary
-    opacity: 0.9
+    color: root.foreground
+    opacity: 0.45
     font.family: root.fontFamily
     font.pixelSize: root.labelFont
-    font.letterSpacing: 1.5
-  }
-
-  component SectionMeta: Text {
-    textFormat: Text.PlainText
-    color: root.secondary
-    opacity: 0.75
-    font.family: root.fontFamily
-    font.pixelSize: root.labelFont
+    font.letterSpacing: 1.4
   }
 
   component KeyCap: Rectangle {
     id: keyCap
     property string label
+    property bool primary: false
     width: keyCapLabel.implicitWidth + Style.space(9)
     height: root.capHeight
-    radius: root.componentRadius
-    color: theme.surfaceStrong
-    border.color: Style.normalBorderFor(root.foreground, Color.accent)
+    radius: 5
+    color: primary ? Util.alpha(Color.accent, 0.15) : root.keycapFill
+    border.color: primary ? Util.alpha(Color.accent, 0.45) : Util.alpha(root.foreground, 0.20)
     border.width: 1
     Text {
       id: keyCapLabel
       anchors.centerIn: parent
       textFormat: Text.PlainText
       text: keyCap.label
-      color: root.tertiary
-      opacity: 1
+      color: Util.alpha(root.foreground, 0.9)
       font.family: root.fontFamily
       font.pixelSize: root.labelFont
+      font.weight: keyCap.primary ? Font.DemiBold : Font.Normal
     }
   }
 
   component Hint: Row {
     id: hint
-    property var keys: []
+    property string keys
     property string label
-    spacing: Style.space(5)
-    Row {
-      spacing: Style.space(3)
-      anchors.verticalCenter: parent.verticalCenter
-      Repeater {
-        model: hint.keys
-        delegate: KeyCap { required property string modelData; label: modelData }
-      }
-    }
+    property bool primary: false
+    spacing: Style.space(6)
+    KeyCap { label: hint.keys; primary: hint.primary; anchors.verticalCenter: parent.verticalCenter }
     Text {
       textFormat: Text.PlainText
       text: hint.label
-      color: root.secondary
-      opacity: 0.9
+      color: root.hintLabel
       font.family: root.fontFamily
       font.pixelSize: root.labelFont
       anchors.verticalCenter: parent.verticalCenter
@@ -690,7 +684,7 @@ Panel {
     Text {
       textFormat: Text.PlainText
       text: shortcutRow.label
-      color: root.secondary
+      color: root.hintLabel
       font.family: root.fontFamily
       font.pixelSize: root.labelFont
       anchors.verticalCenter: parent.verticalCenter
@@ -707,10 +701,10 @@ Panel {
       textFormat: Text.PlainText
       text: shortcutGroup.title
       color: Color.accent
-      opacity: 0.85
       font.family: root.fontFamily
       font.pixelSize: root.labelFont
       font.letterSpacing: 1.4
+      font.weight: Font.DemiBold
       bottomPadding: Style.space(3)
     }
     Repeater {
@@ -723,49 +717,69 @@ Panel {
     }
   }
 
-  // Filter-tab style action chip: glyph + spaced uppercase label.
-  component Chip: Item {
-    id: chip
+  // One button of the header's segmented control. `active` is the raised,
+  // outlined state Yank uses for the current filter; here it marks the
+  // action Enter will run.
+  component SegmentButton: Rectangle {
+    id: seg
     property string glyph
     property string label
     property bool active: false
     signal clicked()
-    readonly property bool hovered: chipArea.containsMouse
-    width: chipRow.implicitWidth
-    height: Style.space(22)
+    readonly property bool hovered: segArea.containsMouse
+    height: root.headerHeight - Style.space(6)
+    width: segRow.implicitWidth + Style.space(20)
+    radius: Style.space(6)
+    color: active ? Color.popups.background : (hovered ? Util.alpha(root.foreground, 0.06) : "transparent")
+    border.width: active ? 1 : 0
+    border.color: Util.alpha(root.foreground, 0.12)
+    Behavior on color { ColorAnimation { duration: 110 } }
     Row {
-      id: chipRow
-      anchors.verticalCenter: parent.verticalCenter
+      id: segRow
+      anchors.centerIn: parent
       spacing: Style.space(6)
       Text {
-        text: chip.glyph
-        color: chip.active ? Color.accent : (chip.hovered ? root.foreground : root.secondary)
-        opacity: 1
-        Behavior on opacity { NumberAnimation { duration: 110 } }
+        visible: seg.glyph !== ""
+        text: seg.glyph
+        color: seg.active || seg.hovered ? Color.accent : root.foreground
+        opacity: seg.active || seg.hovered ? 1 : 0.55
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         anchors.verticalCenter: parent.verticalCenter
       }
       Text {
         textFormat: Text.PlainText
-        text: chip.label.toUpperCase()
-        color: chip.active ? Color.accent : (chip.hovered ? root.foreground : root.secondary)
-        opacity: 1
-        Behavior on opacity { NumberAnimation { duration: 110 } }
+        text: seg.label
+        color: root.foreground
+        opacity: seg.active ? 1 : (seg.hovered ? 0.8 : 0.55)
         font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        font.letterSpacing: 1.6
-        font.weight: chip.active ? Font.DemiBold : Font.Normal
+        font.pixelSize: Style.font.body
+        font.weight: seg.active ? Font.DemiBold : Font.Normal
         anchors.verticalCenter: parent.verticalCenter
       }
     }
     MouseArea {
-      id: chipArea
+      id: segArea
       anchors.fill: parent
-      anchors.margins: -Style.space(5)
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
-      onClicked: chip.clicked()
+      onClicked: seg.clicked()
+    }
+  }
+
+  // The bordered container the segment buttons sit in.
+  component SegmentGroup: Rectangle {
+    default property alias buttons: segButtons.children
+    height: root.headerHeight
+    width: segButtons.implicitWidth + Style.space(6)
+    radius: Style.space(8)
+    color: Util.alpha(root.foreground, 0.05)
+    border.width: 1
+    border.color: Util.alpha(root.foreground, 0.10)
+    Row {
+      id: segButtons
+      anchors.centerIn: parent
+      spacing: Style.space(2)
     }
   }
 
@@ -794,17 +808,21 @@ Panel {
     readonly property string brand: BrandIcons.forIssuer(badge.issuer)
     readonly property bool hasBrand: brand !== ""
     readonly property string brandColor: BrandIcons.brandColor(badge.issuer)
-    readonly property color hue: brandColor !== ""
-                                  ? brandColor
-                                  : theme.badgeHue(badge.issuer !== "" ? badge.issuer : badge.label)
+    // A near-black mark (GitHub, Slack) disappears on a dark popup, so there
+    // it takes the theme's text colour; every other brand keeps its own.
+    readonly property bool brandTooDark: brandColor !== "" && !root.lightTheme
+                                         && Qt.color(brandColor).hslLightness < 0.3
+    readonly property color hue: brandTooDark ? root.foreground
+                               : (brandColor !== "" ? brandColor
+                                  : theme.badgeHue(badge.issuer !== "" ? badge.issuer : badge.label))
     // The plate is the mark's own hue at low alpha, so it frames the mark with
     // contrast rather than diluting it.
     readonly property real plateAlpha: hasBrand ? (hot ? 0.20 : 0.10)
                                                 : (hot ? 0.28 : 0.14)
 
-    width: Style.space(26)
+    width: root.rowHeight - Style.space(14)
     height: width
-    radius: root.componentRadius
+    radius: Style.space(6)
     color: Util.alpha(hue, plateAlpha)
     border.color: Util.alpha(hue, hasBrand ? (hot ? 0.55 : 0.28) : (hot ? 0.6 : 0.3))
     border.width: 1
@@ -820,14 +838,18 @@ Panel {
       source: badge.hasBrand ? Qt.resolvedUrl("brands/" + badge.brand + ".svg") : ""
       // Draw at device resolution rather than the logical 14px, or the mark
       // softens on this 2x display.
-      sourceSize.width: Math.round(Style.space(14) * 2)
-      sourceSize.height: Math.round(Style.space(14) * 2)
-      width: Style.space(14)
+      sourceSize.width: Math.round(Style.space(17) * 2)
+      sourceSize.height: Math.round(Style.space(17) * 2)
+      width: Style.space(17)
       height: width
       fillMode: Image.PreserveAspectFit
       smooth: true
       layer.enabled: true
+      // The vendored marks are black. Colorization keeps their lightness, so
+      // on a dark popup they are lifted to white first and then tinted —
+      // otherwise every mark is a dark shape on a dark tile.
       layer.effect: MultiEffect {
+        brightness: root.lightTheme ? 0 : 1.0
         colorization: 1.0
         colorizationColor: badge.hue
       }
@@ -911,17 +933,16 @@ Panel {
 
     Rectangle {
       width: parent.width
-      height: Style.space(32)
-      radius: root.componentRadius
-      color: theme.surfaceLight
+      height: root.headerHeight
+      radius: Style.space(8)
+      color: Util.alpha(root.foreground, 0.05)
       border.width: 1
       // idle → focus rings come from the theme's control-state tokens, so the
       // field lights up in exactly the accent the rest of the desktop uses for
       // focus. The error state is the theme's own red, at full strength: it is
       // the one state that must not look like a tint.
       border.color: field.invalid ? theme.red
-                  : (input.activeFocus ? Style.focusBorderFor(root.foreground, Color.accent)
-                                       : Style.normalBorderFor(root.foreground, Color.accent))
+                  : (input.activeFocus ? Util.alpha(Color.accent, 0.55) : Util.alpha(root.foreground, 0.10))
       Behavior on border.color { ColorAnimation { duration: 120 } }
 
       TextInput {
@@ -947,8 +968,8 @@ Panel {
           anchors.fill: parent
           visible: input.text === ""
           text: field.placeholder
-          color: root.secondary
-          opacity: 0.8
+          color: root.foreground
+          opacity: 0.38
           font: input.font
           verticalAlignment: Text.AlignVCenter
           elide: Text.ElideRight
@@ -964,23 +985,21 @@ Panel {
     property bool active: false
     signal clicked()
     width: optionLabel.implicitWidth + Style.space(14)
-    height: root.capHeight + Style.space(4)
-    radius: height / 2
+    height: root.capHeight + Style.space(6)
+    radius: Style.space(6)
     // A selector row is exactly what the theme's selected/normal states are
     // for, so the chips agree with every Toggle, tab strip and dropdown in the
     // shell rather than inventing a second accent tint.
-    color: active ? Style.selectedFillFor(root.foreground, Color.accent)
-                  : Style.normalFillFor(root.foreground, Color.accent)
+    color: active ? Color.popups.background : Util.alpha(root.foreground, 0.05)
     border.width: 1
-    border.color: active ? Style.selectedBorderFor(root.foreground, Color.accent)
-                         : Style.normalBorderFor(root.foreground, Color.accent)
+    border.color: active ? Util.alpha(Color.accent, 0.55) : Util.alpha(root.foreground, 0.10)
     Behavior on color { ColorAnimation { duration: 90 } }
     Text {
       id: optionLabel
       anchors.centerIn: parent
       textFormat: Text.PlainText
       text: option.label
-      color: option.active ? Color.accent : root.tertiary
+      color: option.active ? Color.accent : root.foreground
       font.family: root.fontFamily
       font.pixelSize: root.labelFont
       font.weight: option.active ? Font.DemiBold : Font.Normal
@@ -997,7 +1016,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: root.mode === "list" ? searchInput : (root.mode === "manual" ? issuerField.input : keyCatcher)
-    contentWidth: popup.fittedContentWidth(Style.space(400))
+    contentWidth: popup.fittedContentWidth(Style.space(460))
     contentHeight: popup.fittedContentHeight(contentColumn.implicitHeight, Style.space(820))
 
     PanelKeyCatcher {
@@ -1021,551 +1040,518 @@ Panel {
       Column {
         id: contentColumn
         width: parent.width
-        spacing: Style.space(8)
+        spacing: 0
 
-        // ---- control card: label, search, action chips ----
-        Card {
+        // ---- header: search + actions, or the current step's title ----
+        Item {
+          id: header
           width: parent.width
-          height: controlColumn.implicitHeight + root.cardPadding * 2
+          height: root.headerHeight + Style.space(12)
 
-          Column {
-            id: controlColumn
+          // list: search field
+          Rectangle {
+            id: searchField
+            visible: root.mode === "list"
             anchors.left: parent.left
-            anchors.right: parent.right
+            anchors.right: headerActions.left
+            anchors.rightMargin: Style.space(8)
             anchors.top: parent.top
-            anchors.margins: root.cardPadding
-            spacing: Style.space(8)
+            height: root.headerHeight
+            radius: Style.space(8)
+            color: Util.alpha(root.foreground, 0.05)
+            border.width: 1
+            border.color: root.filterText.length > 0 ? Util.alpha(Color.accent, 0.55) : Util.alpha(root.foreground, 0.10)
+            Behavior on border.color { ColorAnimation { duration: 120 } }
 
-            Item {
-              width: parent.width
-              height: root.labelFont + Style.space(3)
-              SectionLabel {
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-                text: {
-                  if (root.mode === "scan") return "SCAN  ·  WEBCAM"
-                  if (root.mode === "confirm") return "SCAN  ·  FOUND"
-                  if (root.mode === "manual") return "ADD  ·  MANUAL"
-                  return "TOTP  ·  AUTHENTICATOR"
-                }
-              }
-              SectionMeta {
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                text: {
-                  if (root.actionStatus !== "") return root.actionStatus
-                  if (root.mode === "scan") return decodeProcess.running ? "decoding…" : "looking for a QR code"
-                  if (root.mode === "confirm") return root.scanFound.length === 1 ? "1 account" : root.scanFound.length + " accounts"
-                  if (root.mode === "manual") return manualProcess.running ? "saving…" : (root.manualSecretIsUrl ? "otpauth URL" : "base32 secret")
-                  if (root.filterText === "")
-                    return root.accounts.length === 1 ? "1 account" : root.accounts.length + " accounts"
-                  return root.filteredAccounts.length + " of " + root.accounts.length
-                }
-                color: root.actionStatus !== "" ? Color.accent : root.foreground
-                opacity: root.actionStatus !== "" ? 1 : 0.35
-              }
+            Text {
+              id: searchIcon
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(11)
+              anchors.verticalCenter: parent.verticalCenter
+              text: "󰍉"
+              color: root.filterText.length > 0 ? Color.accent : root.foreground
+              opacity: root.filterText.length > 0 ? 1 : 0.4
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.title
             }
 
-            // search field
-            Rectangle {
-              id: searchField
-              visible: root.mode === "list"
-              width: parent.width
-              height: Style.space(34)
-              radius: root.componentRadius
-              color: theme.surfaceLight
-              border.width: 1
-              // Same two-state treatment as the manual-entry fields, so the
-              // search box and the form beside it read as one control family.
-              border.color: searchInput.activeFocus || root.filterText.length > 0
-                            ? Style.focusBorderFor(root.foreground, Color.accent)
-                            : Style.normalBorderFor(root.foreground, Color.accent)
-              Behavior on border.color { ColorAnimation { duration: 120 } }
-
-              Row {
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(11)
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(10)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(8)
-
-                Text {
-                  text: "󰍉"
-                  color: root.filterText.length > 0 ? Color.accent : root.foreground
-                  opacity: root.filterText.length > 0 ? 1 : 0.45
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.title
-                  anchors.verticalCenter: parent.verticalCenter
+            TextInput {
+              id: searchInput
+              anchors.left: searchIcon.right
+              anchors.leftMargin: Style.space(9)
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(10)
+              anchors.verticalCenter: parent.verticalCenter
+              color: root.foreground
+              selectionColor: theme.selection
+              selectedTextColor: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.subtitle
+              clip: true
+              text: root.filterText
+              onTextChanged: {
+                if (root.filterText === text) return
+                root.filterText = text
+                root.selectedIndex = 0
+                root.cursorActive = root.filteredAccounts.length > 0
+              }
+              Text {
+                anchors.fill: parent
+                visible: searchInput.text === ""
+                text: "Search accounts"
+                color: root.foreground
+                opacity: 0.38
+                font: searchInput.font
+                verticalAlignment: Text.AlignVCenter
+              }
+              Keys.onPressed: function(event) {
+                if (root.deleteConfirmOpen) {
+                  deleteConfirm.handleKey(event); event.accepted = true; return
                 }
-
-                TextInput {
-                  id: searchInput
-                  width: parent.width - Style.space(30)
-                  anchors.verticalCenter: parent.verticalCenter
-                  color: root.foreground
-                  selectionColor: theme.selection
-                  selectedTextColor: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  clip: true
-                  text: root.filterText
-                  onTextChanged: {
-                    if (root.filterText === text) return
-                    root.filterText = text
-                    root.selectedIndex = 0
-                    root.cursorActive = root.filteredAccounts.length > 0
-                  }
-                  Text {
-                    anchors.fill: parent
-                    visible: searchInput.text === ""
-                    text: "Search accounts…"
-                    color: root.secondary
-                    opacity: 0.8
-                    font: searchInput.font
-                    verticalAlignment: Text.AlignVCenter
-                  }
-                  Keys.onPressed: function(event) {
-                    if (root.deleteConfirmOpen) {
-                      deleteConfirm.handleKey(event); event.accepted = true; return
-                    }
-                    var ctrl = event.modifiers & Qt.ControlModifier
-                    if (ctrl && event.key === Qt.Key_S) { root.enterScan(); event.accepted = true }
-                    else if (ctrl && event.key === Qt.Key_N) { root.openManualAdd(); event.accepted = true }
-                    else if (ctrl && event.key === Qt.Key_R) { root.refresh(); event.accepted = true }
-                    else if (ctrl && event.key === Qt.Key_J) { root.moveSelection(1); event.accepted = true }
-                    else if (ctrl && event.key === Qt.Key_K) { root.moveSelection(-1); event.accepted = true }
-                    // Delete removes an account only when it cannot mean "delete a
-                    // character": with an empty search box, or with Shift held.
-                    else if (event.key === Qt.Key_Delete
-                             && ((event.modifiers & Qt.ShiftModifier) || text === "")) {
-                      root.requestDeleteSelected(); event.accepted = true
-                    }
-                    else if (event.key === Qt.Key_Down) { root.moveSelection(1); event.accepted = true }
-                    else if (event.key === Qt.Key_Up) { root.moveSelection(-1); event.accepted = true }
-                    else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.copySelected(); event.accepted = true }
-                    else if (event.key === Qt.Key_Escape) { root.handleEscape(); event.accepted = true }
-                    else event.accepted = false
-                  }
+                var ctrl = event.modifiers & Qt.ControlModifier
+                if (ctrl && event.key === Qt.Key_S) { root.enterScan(); event.accepted = true }
+                else if (ctrl && event.key === Qt.Key_N) { root.openManualAdd(); event.accepted = true }
+                else if (ctrl && event.key === Qt.Key_R) { root.refresh(); event.accepted = true }
+                else if (ctrl && event.key === Qt.Key_J) { root.moveSelection(1); event.accepted = true }
+                else if (ctrl && event.key === Qt.Key_K) { root.moveSelection(-1); event.accepted = true }
+                // Delete removes an account only when it cannot mean "delete a
+                // character": with an empty search box, or with Shift held.
+                else if (event.key === Qt.Key_Delete
+                         && ((event.modifiers & Qt.ShiftModifier) || text === "")) {
+                  root.requestDeleteSelected(); event.accepted = true
                 }
+                else if (event.key === Qt.Key_Down) { root.moveSelection(1); event.accepted = true }
+                else if (event.key === Qt.Key_Up) { root.moveSelection(-1); event.accepted = true }
+                else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.copySelected(); event.accepted = true }
+                else if (event.key === Qt.Key_Escape) { root.handleEscape(); event.accepted = true }
+                else event.accepted = false
               }
             }
+          }
 
-            // action chips
-            Row {
-              width: parent.width
-              spacing: Style.space(22)
-              Chip {
-                visible: root.mode === "list"
-                glyph: "󰄀"; label: "Scan"
-                onClicked: root.enterScan()
-              }
-              Chip {
-                visible: root.mode === "list"
-                glyph: ""; label: "Add manually"
-                onClicked: root.openManualAdd()
-              }
-              Chip {
-                visible: root.mode !== "list"
-                glyph: "󰁍"; label: "Back to codes"
+          // other modes: back + the step's title
+          Row {
+            visible: root.mode !== "list"
+            anchors.left: parent.left
+            anchors.right: headerActions.left
+            anchors.rightMargin: Style.space(8)
+            anchors.top: parent.top
+            height: root.headerHeight
+            spacing: Style.space(10)
+
+            SegmentGroup {
+              anchors.verticalCenter: parent.verticalCenter
+              SegmentButton {
+                glyph: "󰁍"; label: "Codes"
                 onClicked: root.mode === "manual" ? root.backToList() : root.leaveScan()
               }
-              Chip {
-                visible: root.mode === "confirm"
-                glyph: "󰄬"; label: "Add"
-                active: true
-                onClicked: root.confirmAdd()
+            }
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: {
+                if (root.mode === "scan") return "Scan a QR code"
+                if (root.mode === "confirm") return root.scanFound.length === 1 ? "Found an account" : "Found " + root.scanFound.length + " accounts"
+                return "New account"
               }
-              Chip {
-                visible: root.mode === "manual"
-                glyph: "󰄬"; label: "Save"
-                active: root.manualReady
-                onClicked: root.submitManual()
-              }
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.subtitle
+              font.weight: Font.DemiBold
+            }
+          }
+
+          SegmentGroup {
+            id: headerActions
+            anchors.right: parent.right
+            anchors.top: parent.top
+            SegmentButton {
+              visible: root.mode === "list" || root.mode === "scan"
+              glyph: "󰄀"; label: "Scan"
+              active: root.mode === "scan"
+              onClicked: root.enterScan()
+            }
+            SegmentButton {
+              visible: root.mode === "list" || root.mode === "scan" || root.mode === "manual"
+              glyph: root.mode === "manual" ? "󰄬" : "󰐕"
+              label: root.mode === "manual" ? "Save" : "Add"
+              active: root.mode === "manual" && root.manualReady
+              onClicked: root.mode === "manual" ? root.submitManual() : root.openManualAdd()
+            }
+            SegmentButton {
+              visible: root.mode === "confirm"
+              glyph: "󰄬"; label: "Add"
+              active: true
+              onClicked: root.confirmAdd()
             }
           }
         }
 
-        // ---- entries card ----
-        Card {
+        Divider {}
+
+        // ---- body ----
+        Column {
+          id: body
           width: parent.width
-          height: entriesColumn.implicitHeight + Style.space(16)
+          topPadding: Style.space(6)
+          bottomPadding: Style.space(6)
+          spacing: Style.space(6)
 
-          Column {
-            id: entriesColumn
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: parent.top
-            anchors.margins: Style.space(8)
-            spacing: Style.space(6)
+          // error banner
+          Text {
+            visible: root.errorText !== ""
+            width: parent.width
+            leftPadding: Style.space(12)
+            rightPadding: Style.space(12)
+            topPadding: Style.space(4)
+            text: root.errorText
+            textFormat: Text.PlainText
+            color: theme.red
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
 
-            // error banner
-            Text {
-              visible: root.errorText !== ""
-              width: parent.width
-              leftPadding: Style.space(6)
-              text: root.errorText
-              textFormat: Text.PlainText
-              color: theme.red
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              wrapMode: Text.WordWrap
-            }
+          // ---- list ----
+          ListView {
+            id: accountList
+            visible: root.mode === "list" && root.filteredAccounts.length > 0
+            width: parent.width
+            height: visible ? Math.min(contentHeight, (root.rowHeight + spacing) * 7.5) : 0
+            spacing: Style.space(2)
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            interactive: contentHeight > height
+            model: root.filteredAccounts
+            currentIndex: root.cursorActive ? root.selectedIndex : -1
+            onCurrentIndexChanged: if (currentIndex >= 0) positionViewAtIndex(currentIndex, ListView.Contain)
+            ScrollBar.vertical: ScrollBar { policy: accountList.interactive ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff }
 
-            // section header
-            Item {
-              width: parent.width
-              height: root.labelFont + Style.space(10)
-              SectionLabel {
+            delegate: Rectangle {
+              id: row
+              required property var modelData
+              required property int index
+              readonly property int remaining: root.remainingFor(modelData)
+              readonly property int period: Math.max(1, Number(modelData.period) || 30)
+              readonly property bool urgent: remaining <= 5
+              readonly property bool hasCursor: root.cursorActive && root.selectedIndex === index
+              readonly property bool hovered: rowArea.containsMouse
+              readonly property string issuer: String(modelData.issuer || "")
+              readonly property string name: String(modelData.name || "")
+              readonly property string title: issuer !== "" ? issuer : name
+              readonly property string caption: issuer !== "" && name.toLowerCase() !== issuer.toLowerCase() ? name : ""
+
+              width: ListView.view.width
+              height: root.rowHeight
+              radius: Style.space(7)
+              color: hasCursor ? root.selectedBackground : (hovered ? root.rowHover : "transparent")
+              Behavior on color { ColorAnimation { duration: 90 } }
+
+              Rectangle {
+                visible: row.hasCursor
+                width: 3
+                height: parent.height * 0.46
+                radius: 1.5
+                color: Color.accent
                 anchors.left: parent.left
-                anchors.leftMargin: Style.space(6)
+                anchors.leftMargin: Style.space(3)
                 anchors.verticalCenter: parent.verticalCenter
-                text: {
-                  if (root.mode === "scan") return "VIEWFINDER"
-                  if (root.mode === "confirm") return "NEW  ·  " + root.scanFound.length
-                  if (root.mode === "manual") return "NEW ACCOUNT"
-                  return "CODES  ·  " + root.filteredAccounts.length
-                }
               }
-              SectionMeta {
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-                visible: root.mode === "list" && root.accounts.length > 0
-                text: "click or ⏎ copies"
+
+              MouseArea {
+                id: rowArea
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onEntered: { root.cursorActive = true; root.selectedIndex = row.index }
+                onClicked: root.copyAt(row.index)
               }
-            }
 
-            // ---- list ----
-            ListView {
-              id: accountList
-              visible: root.mode === "list" && root.filteredAccounts.length > 0
-              width: parent.width
-              height: visible ? Math.min(contentHeight, root.rowHeight * 7.5) : 0
-              spacing: 0
-              clip: true
-              boundsBehavior: Flickable.StopAtBounds
-              interactive: contentHeight > height
-              model: root.filteredAccounts
-              currentIndex: root.cursorActive ? root.selectedIndex : -1
-              onCurrentIndexChanged: if (currentIndex >= 0) positionViewAtIndex(currentIndex, ListView.Contain)
-              ScrollBar.vertical: ScrollBar { policy: accountList.interactive ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff }
+              RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(12)
+                anchors.rightMargin: Style.space(12)
+                spacing: Style.space(11)
 
-              delegate: Rectangle {
-                id: row
-                required property var modelData
-                required property int index
-                readonly property int remaining: root.remainingFor(modelData)
-                readonly property int period: Math.max(1, Number(modelData.period) || 30)
-                readonly property bool urgent: remaining <= 5
-                readonly property bool hasCursor: root.cursorActive && root.selectedIndex === index
-                readonly property bool hovered: rowArea.containsMouse
-                readonly property string issuer: String(modelData.issuer || "")
-                readonly property string name: String(modelData.name || "")
-                readonly property string title: issuer !== "" ? issuer : name
-                readonly property string caption: issuer !== "" && name.toLowerCase() !== issuer.toLowerCase() ? name : ""
+                Badge { label: row.title; issuer: row.issuer; hot: row.hasCursor }
 
-                width: ListView.view.width
-                height: root.rowHeight
-                radius: root.componentRadius
-                color: hasCursor ? root.selectedBackground : (hovered ? root.rowHover : "transparent")
-                Behavior on color { ColorAnimation { duration: 90 } }
-
-                Rectangle {
-                  visible: row.hasCursor
-                  width: 3
-                  height: parent.height * 0.5
-                  radius: 1.5
-                  color: Color.accent
-                  anchors.left: parent.left
-                  anchors.leftMargin: Style.space(5)
-                  anchors.verticalCenter: parent.verticalCenter
-                }
-
-                MouseArea {
-                  id: rowArea
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onEntered: { root.cursorActive = true; root.selectedIndex = row.index }
-                  onClicked: root.copyAt(row.index)
-                }
-
-                RowLayout {
-                  anchors.fill: parent
-                  anchors.leftMargin: Style.space(14)
-                  anchors.rightMargin: Style.space(12)
-                  spacing: Style.space(11)
-
-                  Badge { label: row.title; issuer: row.issuer; hot: row.hasCursor }
-
-                  ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: Style.space(1)
-                    Text {
-                      Layout.fillWidth: true
-                      text: row.title
-                      textFormat: Text.PlainText
-                      color: row.hasCursor ? Color.accent : root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.body
-                      font.weight: Font.DemiBold
-                      elide: Text.ElideRight
-                    }
-                    Text {
-                      Layout.fillWidth: true
-                      visible: text !== ""
-                      text: row.caption
-                      textFormat: Text.PlainText
-                      color: root.secondary
-                      opacity: 1
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                      elide: Text.ElideRight
-                    }
-                  }
-
+                ColumnLayout {
+                  Layout.fillWidth: true
+                  spacing: Style.space(2)
                   Text {
-                    text: row.modelData.displayCode
+                    Layout.fillWidth: true
+                    text: row.title
                     textFormat: Text.PlainText
-                    color: row.urgent ? theme.red : root.foreground
+                    color: root.foreground
                     font.family: root.fontFamily
-                    font.pixelSize: Style.font.heading
-                    font.weight: Font.DemiBold
-                    font.letterSpacing: 2
-                    Layout.alignment: Qt.AlignVCenter
-                  }
-
-                  CountdownRing {
-                    remaining: row.remaining
-                    period: row.period
-                    Layout.alignment: Qt.AlignVCenter
-                  }
-                }
-              }
-            }
-
-            // ---- empty / no-match ----
-            Item {
-              visible: root.mode === "list" && root.filteredAccounts.length === 0 && root.errorText === ""
-              width: parent.width
-              height: visible ? Style.space(96) : 0
-              Column {
-                anchors.centerIn: parent
-                spacing: Style.space(6)
-                Text {
-                  anchors.horizontalCenter: parent.horizontalCenter
-                  text: root.accounts.length === 0 ? root.defaultGlyph : "󰍉"
-                  color: root.secondary
-                  opacity: 0.6
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.display
-                }
-                Text {
-                  anchors.horizontalCenter: parent.horizontalCenter
-                  text: root.accounts.length === 0
-                    ? "No accounts yet — scan a QR code from your phone."
-                    : "Nothing matches “" + root.filterText + "”."
-                  textFormat: Text.PlainText
-                  color: root.secondary
-                  opacity: 1
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
-                }
-              }
-            }
-
-            // ---- manual entry form ----
-            Column {
-              visible: root.mode === "manual"
-              width: parent.width - Style.space(12)
-              anchors.horizontalCenter: parent.horizontalCenter
-              spacing: Style.space(10)
-
-              FormField {
-                id: issuerField
-                label: "ISSUER"
-                placeholder: "GitHub"
-                text: root.manualIssuer
-                onTextChanged: root.manualIssuer = text
-                nextItem: accountField.input
-                Component.onCompleted: input.KeyNavigation.backtab = secretField.input
-              }
-              FormField {
-                id: accountField
-                label: "ACCOUNT"
-                placeholder: "you@example.com"
-                text: root.manualAccount
-                onTextChanged: root.manualAccount = text
-                nextItem: secretField.input
-                Component.onCompleted: input.KeyNavigation.backtab = issuerField.input
-              }
-              FormField {
-                id: secretField
-                label: "SECRET  ·  BASE32, OR PASTE AN OTPAUTH:// URL"
-                placeholder: "JBSW Y3DP EHPK 3PXP"
-                text: root.manualSecret
-                onTextChanged: root.manualSecret = text
-                invalid: root.manualSecret.trim() !== "" && !root.manualSecretValid
-                nextItem: issuerField.input
-                Component.onCompleted: input.KeyNavigation.backtab = accountField.input
-              }
-
-              // options only matter for a raw secret; a URL carries its own
-              Row {
-                visible: !root.manualSecretIsUrl
-                width: parent.width
-                spacing: Style.space(16)
-                Column {
-                  spacing: Style.space(4)
-                  SectionLabel { text: "DIGITS" }
-                  Row {
-                    spacing: Style.space(4)
-                    Repeater {
-                      model: [6, 7, 8]
-                      delegate: OptionChip {
-                        required property int modelData
-                        label: String(modelData)
-                        active: root.manualDigits === modelData
-                        onClicked: root.manualDigits = modelData
-                      }
-                    }
-                  }
-                }
-                Column {
-                  spacing: Style.space(4)
-                  SectionLabel { text: "PERIOD" }
-                  Row {
-                    spacing: Style.space(4)
-                    Repeater {
-                      model: [30, 60]
-                      delegate: OptionChip {
-                        required property int modelData
-                        label: modelData + "s"
-                        active: root.manualPeriod === modelData
-                        onClicked: root.manualPeriod = modelData
-                      }
-                    }
-                  }
-                }
-                Column {
-                  spacing: Style.space(4)
-                  SectionLabel { text: "ALGORITHM" }
-                  Row {
-                    spacing: Style.space(4)
-                    Repeater {
-                      model: ["SHA1", "SHA256", "SHA512"]
-                      delegate: OptionChip {
-                        required property string modelData
-                        label: modelData
-                        active: root.manualAlgorithm === modelData
-                        onClicked: root.manualAlgorithm = modelData
-                      }
-                    }
-                  }
-                }
-              }
-              Item { width: 1; height: Style.space(2) }
-            }
-
-            // ---- viewfinder ----
-            Loader {
-              id: scanLoader
-              width: parent.width
-              height: active ? Math.round(width * 3 / 4) : 0
-              visible: active
-              active: root.opened && (root.mode === "scan" || root.mode === "confirm")
-              sourceComponent: ScanPane {
-                active: root.mode === "scan"
-                busy: decodeProcess.running
-                mirror: root.setting("mirrorPreview", true)
-                framePath: root.framePath
-                foreground: root.foreground
-                frameColor: Util.alpha(theme.surfaceLight, 0.85)
-                busyColor: theme.green
-                fontFamily: root.fontFamily
-                onFrameCaptured: function(path) { root.onFrameCaptured(path) }
-                onFailed: function(message) { root.scanHint = message }
-              }
-            }
-
-            Text {
-              visible: root.mode === "scan"
-              width: parent.width
-              topPadding: Style.space(2)
-              text: root.scanHint
-              textFormat: Text.PlainText
-              color: root.secondary
-              opacity: 1
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              wrapMode: Text.WordWrap
-              horizontalAlignment: Text.AlignHCenter
-            }
-
-            // ---- found accounts ----
-            Repeater {
-              model: root.mode === "confirm" ? root.scanFound : []
-              delegate: Rectangle {
-                id: found
-                required property var modelData
-                required property int index
-                width: parent.width
-                height: root.rowHeight
-                radius: root.componentRadius
-                color: index === 0 ? root.selectedBackground : "transparent"
-
-                Rectangle {
-                  visible: found.index === 0
-                  width: 3
-                  height: parent.height * 0.5
-                  radius: 1.5
-                  color: Color.accent
-                  anchors.left: parent.left
-                  anchors.leftMargin: Style.space(5)
-                  anchors.verticalCenter: parent.verticalCenter
-                }
-
-                RowLayout {
-                  anchors.fill: parent
-                  anchors.leftMargin: Style.space(14)
-                  anchors.rightMargin: Style.space(12)
-                  spacing: Style.space(11)
-                  Badge { label: found.modelData.issuer || found.modelData.name
-                                                 issuer: found.modelData.issuer || ""
-                                                 hot: found.index === 0 }
-                  ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: Style.space(1)
-                    Text {
-                      Layout.fillWidth: true
-                      text: found.modelData.issuer || found.modelData.name
-                      textFormat: Text.PlainText
-                      color: root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.body
-                      font.weight: Font.DemiBold
-                      elide: Text.ElideRight
-                    }
-                    Text {
-                      Layout.fillWidth: true
-                      text: (found.modelData.name || "") + "  ·  " + found.modelData.algorithm
-                            + " · " + found.modelData.digits + " digits · " + found.modelData.period + "s"
-                      textFormat: Text.PlainText
-                      color: root.secondary
-                      opacity: 1
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                      elide: Text.ElideRight
-                    }
+                    font.pixelSize: Style.font.body
+                    elide: Text.ElideRight
                   }
                   Text {
-                    text: addProcess.running ? "saving…" : "new"
+                    Layout.fillWidth: true
+                    text: row.caption !== "" ? row.caption : "TOTP  ·  " + row.period + "s"
+                    textFormat: Text.PlainText
+                    color: root.foreground
+                    opacity: 0.45
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+                }
+
+                Text {
+                  text: row.modelData.displayCode
+                  textFormat: Text.PlainText
+                  color: row.urgent ? theme.red : root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.heading
+                  font.weight: Font.DemiBold
+                  font.letterSpacing: 2
+                  Layout.alignment: Qt.AlignVCenter
+                }
+
+                CountdownRing {
+                  remaining: row.remaining
+                  period: row.period
+                  Layout.alignment: Qt.AlignVCenter
+                }
+              }
+            }
+          }
+
+          // ---- empty / no-match ----
+          Item {
+            visible: root.mode === "list" && root.filteredAccounts.length === 0 && root.errorText === ""
+            width: parent.width
+            height: visible ? Style.space(120) : 0
+            Column {
+              anchors.centerIn: parent
+              spacing: Style.space(8)
+              Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: root.accounts.length === 0 ? root.defaultGlyph : "󰍉"
+                color: Color.accent
+                opacity: 0.55
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.display
+              }
+              Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: root.accounts.length === 0
+                  ? "No accounts yet — scan a QR code from your phone"
+                  : "No matches for “" + root.filterText + "”"
+                textFormat: Text.PlainText
+                color: root.foreground
+                opacity: 0.7
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+            }
+          }
+
+          // ---- manual entry form ----
+          Column {
+            visible: root.mode === "manual"
+            width: parent.width - Style.space(24)
+            anchors.horizontalCenter: parent.horizontalCenter
+            topPadding: Style.space(4)
+            spacing: Style.space(12)
+
+            FormField {
+              id: issuerField
+              label: "ISSUER"
+              placeholder: "GitHub"
+              text: root.manualIssuer
+              onTextChanged: root.manualIssuer = text
+              nextItem: accountField.input
+              Component.onCompleted: input.KeyNavigation.backtab = secretField.input
+            }
+            FormField {
+              id: accountField
+              label: "ACCOUNT"
+              placeholder: "you@example.com"
+              text: root.manualAccount
+              onTextChanged: root.manualAccount = text
+              nextItem: secretField.input
+              Component.onCompleted: input.KeyNavigation.backtab = issuerField.input
+            }
+            FormField {
+              id: secretField
+              label: "SECRET  ·  BASE32, OR PASTE AN OTPAUTH:// URL"
+              placeholder: "JBSW Y3DP EHPK 3PXP"
+              text: root.manualSecret
+              onTextChanged: root.manualSecret = text
+              invalid: root.manualSecret.trim() !== "" && !root.manualSecretValid
+              nextItem: issuerField.input
+              Component.onCompleted: input.KeyNavigation.backtab = accountField.input
+            }
+
+            // options only matter for a raw secret; a URL carries its own
+            Row {
+              visible: !root.manualSecretIsUrl
+              width: parent.width
+              spacing: Style.space(16)
+              Column {
+                spacing: Style.space(5)
+                SectionLabel { text: "DIGITS" }
+                Row {
+                  spacing: Style.space(4)
+                  Repeater {
+                    model: [6, 7, 8]
+                    delegate: OptionChip {
+                      required property int modelData
+                      label: String(modelData)
+                      active: root.manualDigits === modelData
+                      onClicked: root.manualDigits = modelData
+                    }
+                  }
+                }
+              }
+              Column {
+                spacing: Style.space(5)
+                SectionLabel { text: "PERIOD" }
+                Row {
+                  spacing: Style.space(4)
+                  Repeater {
+                    model: [30, 60]
+                    delegate: OptionChip {
+                      required property int modelData
+                      label: modelData + "s"
+                      active: root.manualPeriod === modelData
+                      onClicked: root.manualPeriod = modelData
+                    }
+                  }
+                }
+              }
+              Column {
+                spacing: Style.space(5)
+                SectionLabel { text: "ALGORITHM" }
+                Row {
+                  spacing: Style.space(4)
+                  Repeater {
+                    model: ["SHA1", "SHA256", "SHA512"]
+                    delegate: OptionChip {
+                      required property string modelData
+                      label: modelData
+                      active: root.manualAlgorithm === modelData
+                      onClicked: root.manualAlgorithm = modelData
+                    }
+                  }
+                }
+              }
+            }
+            Item { width: 1; height: Style.space(2) }
+          }
+
+          // ---- viewfinder ----
+          Loader {
+            id: scanLoader
+            width: parent.width - Style.space(12)
+            anchors.horizontalCenter: parent.horizontalCenter
+            height: active ? Math.round(width * 3 / 4) : 0
+            visible: active
+            active: root.opened && (root.mode === "scan" || root.mode === "confirm")
+            sourceComponent: ScanPane {
+              active: root.mode === "scan"
+              busy: decodeProcess.running
+              mirror: root.setting("mirrorPreview", true)
+              framePath: root.framePath
+              foreground: root.foreground
+              frameColor: Util.alpha(theme.surfaceLight, 0.85)
+              busyColor: theme.green
+              fontFamily: root.fontFamily
+              onFrameCaptured: function(path) { root.onFrameCaptured(path) }
+              onFailed: function(message) { root.scanHint = message }
+            }
+          }
+
+          Text {
+            visible: root.mode === "scan"
+            width: parent.width
+            leftPadding: Style.space(12)
+            rightPadding: Style.space(12)
+            text: root.scanHint
+            textFormat: Text.PlainText
+            color: root.foreground
+            opacity: 0.6
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+            horizontalAlignment: Text.AlignHCenter
+          }
+
+          // ---- found accounts ----
+          Repeater {
+            model: root.mode === "confirm" ? root.scanFound : []
+            delegate: Rectangle {
+              id: found
+              required property var modelData
+              required property int index
+              width: parent.width
+              height: root.rowHeight
+              radius: Style.space(7)
+              color: index === 0 ? root.selectedBackground : "transparent"
+
+              Rectangle {
+                visible: found.index === 0
+                width: 3
+                height: parent.height * 0.46
+                radius: 1.5
+                color: Color.accent
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(3)
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(12)
+                anchors.rightMargin: Style.space(12)
+                spacing: Style.space(11)
+                Badge {
+                  label: found.modelData.issuer || found.modelData.name
+                  issuer: found.modelData.issuer || ""
+                  hot: found.index === 0
+                }
+                ColumnLayout {
+                  Layout.fillWidth: true
+                  spacing: Style.space(2)
+                  Text {
+                    Layout.fillWidth: true
+                    text: found.modelData.issuer || found.modelData.name
+                    textFormat: Text.PlainText
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    elide: Text.ElideRight
+                  }
+                  Text {
+                    Layout.fillWidth: true
+                    text: (found.modelData.name || "") + "  ·  " + found.modelData.algorithm
+                          + "  ·  " + found.modelData.digits + " digits  ·  " + found.modelData.period + "s"
+                    textFormat: Text.PlainText
+                    color: root.foreground
+                    opacity: 0.45
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+                }
+                Rectangle {
+                  Layout.alignment: Qt.AlignVCenter
+                  Layout.preferredHeight: Style.space(20)
+                  Layout.preferredWidth: newLabel.implicitWidth + Style.space(16)
+                  radius: height / 2
+                  color: Util.alpha(theme.green, 0.14)
+                  Text {
+                    id: newLabel
+                    anchors.centerIn: parent
+                    text: addProcess.running ? "Saving…" : "New"
                     color: theme.green
                     font.family: root.fontFamily
-                    font.pixelSize: root.labelFont
-                    font.letterSpacing: 1.4
-                    Layout.alignment: Qt.AlignVCenter
+                    font.pixelSize: Style.font.caption
+                    font.weight: Font.DemiBold
                   }
                 }
               }
@@ -1573,122 +1559,106 @@ Panel {
           }
         }
 
-        // ---- footer card ----
-        //
-        // Collapsed: one quiet "Shortcuts" chip on the left and the mode's
-        // primary action on the right. Hovered: the card grows into titled
-        // groups with an aligned key column, like clippy's footer.
-        Card {
+        // ---- full shortcut reference, opened from the footer ----
+        Column {
+          width: parent.width
+          visible: root.shortcutsOpen
+          spacing: 0
+
+          Divider {}
+
+          Grid {
+            x: Style.space(12)
+            topPadding: Style.space(12)
+            bottomPadding: Style.space(12)
+            width: parent.width - Style.space(24)
+            columns: 2
+            columnSpacing: Style.space(20)
+            rowSpacing: Style.space(12)
+            Repeater {
+              model: root.shortcutGroups
+              delegate: ShortcutGroup {
+                required property var modelData
+                title: modelData.title
+                rows: modelData.rows
+              }
+            }
+          }
+        }
+
+        Divider {}
+
+        // ---- footer: status + key hints ----
+        Item {
           id: footer
           width: parent.width
-          height: root.footerHovered ? footerPanel.implicitHeight + Style.space(22) : Style.space(34)
-          clip: true
-          Behavior on height { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
+          height: Style.space(34)
 
-          // Hover with a grace period: the card resizes under the pointer, and
-          // Qt can report a momentary exit while it does.
-          MouseArea {
-            anchors.fill: parent
-            hoverEnabled: true
-            acceptedButtons: Qt.NoButton
-            onEntered: { collapseGrace.stop(); root.footerHovered = true }
-            onExited: collapseGrace.restart()
+          Text {
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(4)
+            anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
+            text: {
+              if (root.actionStatus !== "") return root.actionStatus
+              if (root.mode === "scan") return decodeProcess.running ? "Decoding…" : "Looking for a QR code"
+              if (root.mode === "confirm") return addProcess.running ? "Saving…" : "Review before adding"
+              if (root.mode === "manual") return manualProcess.running ? "Saving…" : (root.manualSecretIsUrl ? "otpauth URL" : "Base32 secret")
+              if (root.filterText === "")
+                return root.accounts.length === 1 ? "1 account" : root.accounts.length + " accounts"
+              return root.filteredAccounts.length + " of " + root.accounts.length
+            }
+            color: root.actionStatus !== "" ? Color.accent : root.foreground
+            opacity: root.actionStatus !== "" ? 1 : 0.45
+            font.family: root.fontFamily
+            font.pixelSize: root.labelFont
+            font.weight: root.actionStatus !== "" ? Font.DemiBold : Font.Normal
           }
-          Timer { id: collapseGrace; interval: 320; onTriggered: root.footerHovered = false }
 
-          // -- collapsed row --
+          Row {
+            anchors.right: shortcutsToggle.left
+            anchors.rightMargin: Style.space(10)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(12)
+            Repeater {
+              model: root.primaryHints
+              delegate: Hint {
+                required property var modelData
+                keys: modelData.keys
+                label: modelData.label
+                primary: !!modelData.primary
+              }
+            }
+          }
+
+          // keyboard glyph: opens the full shortcut list above the footer
           Item {
-            anchors.fill: parent
-            anchors.leftMargin: root.cardPadding
-            anchors.rightMargin: root.cardPadding
-            visible: !root.footerHovered
+            id: shortcutsToggle
+            width: Style.space(22)
+            height: width
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
 
             Rectangle {
-              anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
-              width: shortcutsChipRow.implicitWidth + Style.space(20)
-              height: root.capHeight + Style.space(8)
-              radius: root.componentRadius
-              color: theme.surfaceStrong
-              border.color: Style.normalBorderFor(root.foreground, Color.accent)
-              border.width: 1
-              Row {
-                id: shortcutsChipRow
-                anchors.centerIn: parent
-                spacing: Style.space(8)
-                Text {
-                  text: "⎯"
-                  color: Color.accent
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  anchors.verticalCenter: parent.verticalCenter
-                }
-                Text {
-                  textFormat: Text.PlainText
-                  text: "Shortcuts"
-                  color: root.tertiary
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  anchors.verticalCenter: parent.verticalCenter
-                }
-              }
+              anchors.fill: parent
+              radius: width / 2
+              color: shortcutsArea.containsMouse || root.shortcutsOpen ? Util.alpha(root.foreground, 0.08) : "transparent"
+              Behavior on color { ColorAnimation { duration: 110 } }
             }
-
-            Row {
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(14)
-              Repeater {
-                model: root.primaryHints
-                delegate: Hint {
-                  required property var modelData
-                  keys: modelData.keys
-                  label: modelData.label
-                }
-              }
+            Text {
+              anchors.centerIn: parent
+              text: "󰌌"
+              color: root.shortcutsOpen ? Color.accent : root.foreground
+              opacity: root.shortcutsOpen ? 1 : 0.55
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
             }
-          }
-
-          // -- expanded panel --
-          Column {
-            id: footerPanel
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.top: parent.top
-            anchors.margins: root.cardPadding
-            spacing: Style.space(10)
-            visible: root.footerHovered
-
-            Item {
-              width: parent.width
-              height: root.capHeight
-              SectionLabel {
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-                text: "KEYBOARD SHORTCUTS"
-              }
-              SectionMeta {
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                text: root.mode === "list" ? "codes" : (root.mode === "manual" ? "manual entry" : "scanner")
-              }
-            }
-
-            // Two columns: a third group wraps underneath rather than
-            // overflowing the popup width.
-            Grid {
-              width: parent.width
-              columns: 2
-              columnSpacing: Style.space(20)
-              rowSpacing: Style.space(12)
-              Repeater {
-                model: root.shortcutGroups
-                delegate: ShortcutGroup {
-                  required property var modelData
-                  title: modelData.title
-                  rows: modelData.rows
-                }
-              }
+            MouseArea {
+              id: shortcutsArea
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.shortcutsOpen = !root.shortcutsOpen
             }
           }
         }

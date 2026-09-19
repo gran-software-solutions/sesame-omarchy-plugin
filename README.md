@@ -8,9 +8,9 @@ webcam scanner, so adding an account means holding your phone up to the laptop.
 
 `de.gransoftware.sesame`&nbsp;&nbsp;·&nbsp;&nbsp;![version](https://img.shields.io/badge/version-1.0.0-2f6f4e?style=flat-square)&nbsp;![shell](https://img.shields.io/badge/Omarchy-shell%20plugin-3b4252?style=flat-square)&nbsp;![qml](https://img.shields.io/badge/built%20with-Quickshell%20%2F%20QML-41cd52?style=flat-square)&nbsp;![store](https://img.shields.io/badge/store-AES--256--GCM-005f87?style=flat-square)
 
-<img src="preview.png" alt="Sesame popup: a search field above a list of accounts, each with a brand mark, a six-digit code and a countdown ring" width="70%">
+<img src="preview.png" alt="Sesame popup in the Tokyo Night theme: a search field beside Scan and Add buttons, above a list of accounts, each with a brand mark in its own colour, a six-digit code and a countdown ring, and a footer of key hints" width="70%">
 
-<sub>Sesame follows the active Omarchy theme.</sub>
+<sub>Sesame follows the active Omarchy theme — Tokyo Night here.</sub>
 
 </div>
 
@@ -90,7 +90,7 @@ secret-tool clear application sesame purpose store-key
 | `Esc` | Clear the filter, go back, or close |
 
 In the scanner, `Enter` stores the account that was found and `Esc` discards
-it. Hover the footer for the full list.
+it. The keyboard button in the footer opens the full list.
 
 ## Settings
 
